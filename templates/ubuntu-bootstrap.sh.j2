@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo "Ubuntu provisioning failed at line $LINENO" >&2' ERR
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+
+if [ "$(ps -p 1 -o comm=)" != systemd ]; then
+  echo "systemd is not PID 1; check /etc/wsl.conf and restart this distribution." >&2
+  exit 1
+fi
+
+for attempt in $(seq 1 60); do
+  if systemctl show --property=Version --value >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+systemctl show --property=Version --value
+
+apt-get update
+apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
+apt-get install -y ca-certificates curl git openssh-client build-essential python3
+
+# Fail rather than removing another container runtime and its dependent packages.
+for package in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
+  if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$'; then
+    echo "Conflicting package $package is installed. Review/remove it before installing Docker CE." >&2
+    exit 1
+  fi
+done
+
+install -m 0755 -d /etc/apt/keyrings
+key_file=$(mktemp)
+trap 'rm -f "$key_file"' EXIT
+curl --fail --silent --show-error --location https://download.docker.com/linux/ubuntu/gpg -o "$key_file"
+install -m 0644 "$key_file" /etc/apt/keyrings/docker.asc
+
+source /etc/os-release
+cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+usermod -aG docker {{ wsl_linux_user | quote }}
+
+# NVM is per user; installing it as root would configure the wrong home directory.
+runuser -u {{ wsl_linux_user | quote }} -- bash <<'USER_SETUP'
+set -eo pipefail
+export NVM_DIR="$HOME/.nvm"
+if [ ! -e "$NVM_DIR" ]; then
+  git clone --branch {{ nvm_version | quote }} --depth 1 https://github.com/nvm-sh/nvm.git "$NVM_DIR"
+else
+  test -d "$NVM_DIR/.git" || {
+    echo "$NVM_DIR exists but is not a Git-managed NVM installation." >&2
+    exit 1
+  }
+  test "$(git -C "$NVM_DIR" remote get-url origin)" = https://github.com/nvm-sh/nvm.git || {
+    echo "Unexpected NVM repository origin." >&2
+    exit 1
+  }
+  git -C "$NVM_DIR" diff --quiet
+  git -C "$NVM_DIR" diff --cached --quiet
+  git -C "$NVM_DIR" fetch --depth 1 origin tag {{ nvm_version | quote }}
+  git -C "$NVM_DIR" checkout --detach {{ nvm_version | quote }}
+fi
+
+touch "$HOME/.bashrc"
+if ! grep -Fxq '# BEGIN ANSIBLE WSL NVM' "$HOME/.bashrc"; then
+  cat >> "$HOME/.bashrc" <<'NVM_PROFILE'
+
+# BEGIN ANSIBLE WSL NVM
+export NVM_DIR="$HOME/.nvm"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  . "$NVM_DIR/nvm.sh"
+fi
+# END ANSIBLE WSL NVM
+NVM_PROFILE
+fi
+
+source "$NVM_DIR/nvm.sh"
+nvm install {{ node_version | quote }}
+nvm alias default {{ node_version | quote }}
+nvm use default
+{% if git_user_name | length > 0 %}
+git config --global user.name {{ git_user_name | quote }}
+{% endif %}
+{% if git_user_email | length > 0 %}
+git config --global user.email {{ git_user_email | quote }}
+{% endif %}
+USER_SETUP
+
+systemctl is-active --quiet docker

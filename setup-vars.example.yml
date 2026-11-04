@@ -1,0 +1,62 @@
+---
+# Optional overrides: copy to setup-vars.yml and edit.
+# Run: ansible-playbook -i inventory.ini setup-wsl.yml -e @setup-vars.yml
+# Use the same Windows account on every run; WSL registration is per user.
+# The account needs administrator privileges and a password for runas.
+# Enable nested virtualization on the VM's hypervisor BEFORE running.
+# Internet access is needed from both Windows and WSL. Configure corporate
+# proxies/trusted CA certificates separately; TLS verification is not disabled.
+# Older inbox WSL is upgraded using --update --web-download before --version
+# is checked; the bootstrap does not require --install --no-distribution.
+#
+# The playbook may reboot Windows and restarts the selected WSL distribution.
+# It upgrades Ubuntu packages on every run. Existing Git checkouts are preserved,
+# not pulled/reset. Docker is enabled whenever WSL starts, not at Windows boot.
+# The Linux user gets no password or sudo grant; administer with wsl.exe -u root.
+# Docker group membership grants root-equivalent access inside Ubuntu.
+# Package installation waits for systemd; image pulls and smoke tests wait
+# up to two minutes for Docker after a cold WSL start.
+
+wsl_linux_user: developer
+nvm_version: v0.40.8
+node_version: "lts/*"
+
+# Git commit identity is not authentication.
+git_user_name: ""
+git_user_email: ""
+
+# For private Git repositories, supply a dedicated SSH key via Ansible Vault.
+# Use an unencrypted automation/deploy key with least-privilege permissions.
+# Known-host lines must come from a trusted source, not blind ssh-keyscan.
+# These managed files do not replace existing default SSH keys/known_hosts.
+# When supplied, Git's global core.sshCommand uses this key and known-hosts file.
+# git_ssh_private_key: "{{ vault_git_ssh_private_key }}"
+# git_ssh_known_hosts: "{{ vault_git_ssh_known_hosts }}"
+
+required_repositories: []
+# required_repositories:
+#   - name: my-project
+#     url: git@github.com:YOUR-ORG/YOUR-REPO.git
+#   - name: public-project
+#     url: https://github.com/YOUR-ORG/PUBLIC-REPO.git
+
+# Run with: ... -e @setup-vars.yml -e @secrets.yml --ask-vault-pass
+# Create encrypted variables with: ansible-vault create secrets.yml
+# Never put real passwords/tokens in this example or in repository URLs.
+# Without a separately configured Docker credential helper, docker login
+# stores reversible credentials in the Linux user's ~/.docker/config.json.
+# Registry tokens are sent using stdin, with Ansible task logging disabled.
+container_registries: []
+# container_registries:
+#   - registry: ghcr.io
+#     username: YOUR-GITHUB-USERNAME
+#     password: "{{ vault_ghcr_token }}"
+#   - registry: artifactory.example.com
+#     username: YOUR-ARTIFACTORY-USERNAME
+#     password: "{{ vault_artifactory_token }}"
+
+common_docker_images:
+  - hello-world:latest
+  - ubuntu:24.04
+  - alpine:latest
+# Add private image names only after configuring their registry credentials.

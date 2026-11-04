@@ -1,0 +1,459 @@
+---
+- name: Provision Ubuntu 24.04, Docker CE, and Node.js in WSL2
+  hosts: windows
+  gather_facts: false
+  become: true
+  become_method: runas
+  become_user: "{{ ansible_user }}"
+  vars:
+    # A full Windows logon avoids the restricted WinRM token for WSL.
+    # Keep this account consistent: WSL distributions are per Windows user.
+    ansible_become_password: "{{ ansible_password }}"
+    wsl_distribution: Ubuntu-24.04
+    wsl_linux_user: developer
+    wsl_install_path: 'C:\WSL\Ubuntu-24.04'
+    wsl_staging_path: 'C:\ProgramData\AnsibleWSL'
+    nvm_version: v0.40.8
+    node_version: "lts/*"
+    git_user_name: ""
+    git_user_email: ""
+    git_ssh_private_key: ""
+    git_ssh_known_hosts: ""
+    required_repositories: []
+    container_registries: []
+    common_docker_images:
+      - hello-world:latest
+      - ubuntu:24.04
+      - alpine:latest
+    wsl_docker_ready_script: |
+      for attempt in $(seq 1 60); do
+        if docker info >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+      done
+      docker info >/dev/null
+
+  pre_tasks:
+    - name: Verify WinRM connectivity
+      ansible.windows.win_ping:
+      become: false
+
+    - name: Validate configuration
+      ansible.builtin.assert:
+        that:
+          - wsl_linux_user is match('^[a-z_][a-z0-9_-]*$')
+          - wsl_linux_user != 'root'
+          - wsl_distribution is match('^[A-Za-z0-9._-]+$')
+          - nvm_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+          - node_version is match('^(lts/[A-Za-z0-9*.-]+|[0-9]+(\.[0-9]+){0,2})$')
+          - (git_ssh_private_key | length == 0) or (git_ssh_known_hosts | length > 0)
+        fail_msg: Check the Linux username, NVM/Node versions, and SSH known-hosts configuration.
+
+    - name: Validate repository configuration
+      ansible.builtin.assert:
+        that:
+          - item.name is match('^[A-Za-z0-9._-]+$')
+          - item.name not in ['.', '..']
+          - item.url is match('^(https://|ssh://|git@)')
+          - not (item.url is search('^https://[^/]*@'))
+        fail_msg: Use a safe directory name and a repository URL without embedded credentials.
+      loop: "{{ required_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Validate registry configuration
+      ansible.builtin.assert:
+        that:
+          - item.registry is match('^[A-Za-z0-9.-]+(:[0-9]+)?$')
+          - item.username | length > 0
+          - item.password | length > 0
+        fail_msg: Each registry requires a hostname, username, and token/password.
+      loop: "{{ container_registries }}"
+      no_log: true
+
+    - name: Check Windows prerequisites and full logon identity
+      ansible.windows.win_powershell:
+        error_action: stop
+        script: |
+          $Ansible.Changed = $false
+          $os = Get-CimInstance Win32_OperatingSystem
+          if ([int]$os.BuildNumber -lt 19041) {
+            throw "Use a supported Windows 10/11 or Windows Server 2022+ build with WSL2 support."
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "The inventory account must be a Windows administrator."
+          }
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($architecture -notin @('X64', 'Arm64')) {
+            throw "Unsupported architecture: $architecture"
+          }
+          $Ansible.Result = @{ identity = $identity.Name; architecture = $architecture }
+      register: windows_prerequisites
+
+  tasks:
+    - name: Enable WSL and VirtualMachinePlatform
+      ansible.windows.win_optional_feature:
+        name:
+          - Microsoft-Windows-Subsystem-Linux
+          - VirtualMachinePlatform
+        state: present
+      register: windows_features
+
+    - name: Reboot after enabling Windows features
+      ansible.windows.win_reboot:
+        reboot_timeout: 1200
+      when: windows_features.reboot_required
+
+    # Older inbox WSL supports this upgrade path but not --version or
+    # --install --no-distribution. Verify --version only after upgrading.
+    - name: Install or update the modern WSL engine from the web
+      ansible.windows.win_command:
+        argv: [wsl.exe, --update, --web-download]
+      async: 1800
+      poll: 15
+      register: wsl_update
+      failed_when: wsl_update.rc not in [0, 3010]
+
+    - name: Reboot if the WSL update requires it
+      ansible.windows.win_reboot:
+        reboot_timeout: 1200
+      when: wsl_update.rc == 3010
+
+    - name: Set WSL2 as the default for new distributions
+      ansible.windows.win_command:
+        argv: [wsl.exe, --set-default-version, "2"]
+      changed_when: false
+
+    - name: Verify WSL engine version
+      ansible.windows.win_command:
+        argv: [wsl.exe, --version]
+      changed_when: false
+      register: wsl_version
+
+    - name: Create staging directory
+      ansible.windows.win_file:
+        path: "{{ wsl_staging_path }}"
+        state: directory
+
+    - name: Check whether Ubuntu is already registered for this Windows user
+      ansible.windows.win_powershell:
+        parameters:
+          Distribution: "{{ wsl_distribution }}"
+        error_action: stop
+        script: |
+          param([string]$Distribution)
+          $Ansible.Changed = $false
+          $names = & wsl.exe --list --quiet
+          if ($LASTEXITCODE -ne 0) { throw "Cannot list WSL distributions." }
+          $names = @($names | ForEach-Object { ($_ -replace "`0", '').Trim() })
+          $Ansible.Result = @{ exists = ($names -contains $Distribution) }
+      register: ubuntu_registration
+
+    - name: Download and import official Ubuntu 24.04 without interactive first-run setup
+      when: not ubuntu_registration.result.exists
+      block:
+        - name: Resolve official Ubuntu image URL and SHA256 from the WSL catalog
+          ansible.windows.win_powershell:
+            parameters:
+              Architecture: "{{ windows_prerequisites.result.architecture }}"
+            error_action: stop
+            script: |
+              param([string]$Architecture)
+              $Ansible.Changed = $false
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+              $catalog = Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/microsoft/WSL/master/distributions/DistributionInfo.json'
+              $ubuntu = @($catalog.ModernDistributions.Ubuntu | Where-Object Name -eq 'Ubuntu-24.04')
+              if ($ubuntu.Count -ne 1) { throw "Ubuntu-24.04 is missing or ambiguous in the WSL catalog." }
+              $image = if ($Architecture -eq 'Arm64') { $ubuntu[0].Arm64Url } else { $ubuntu[0].Amd64Url }
+              if (-not $image.Url.StartsWith('https://') -or $image.Sha256 -notmatch '^[a-fA-F0-9]{64}$') {
+                throw "Invalid image metadata in the WSL catalog."
+              }
+              $Ansible.Result = @{ url = $image.Url; checksum = $image.Sha256 }
+          register: ubuntu_image
+
+        - name: Download and checksum Ubuntu root filesystem
+          ansible.windows.win_get_url:
+            url: "{{ ubuntu_image.result.url }}"
+            dest: '{{ wsl_staging_path }}\ubuntu-24.04-rootfs.tar.gz'
+            checksum: "{{ ubuntu_image.result.checksum }}"
+            checksum_algorithm: sha256
+            timeout: 1800
+
+        - name: Create Ubuntu install directory
+          ansible.windows.win_file:
+            path: "{{ wsl_install_path }}"
+            state: directory
+
+        - name: Import Ubuntu as a WSL2 distribution
+          ansible.windows.win_command:
+            argv:
+              - wsl.exe
+              - --import
+              - "{{ wsl_distribution }}"
+              - "{{ wsl_install_path }}"
+              - '{{ wsl_staging_path }}\ubuntu-24.04-rootfs.tar.gz'
+              - --version
+              - "2"
+          async: 1800
+          poll: 15
+
+    - name: Ensure the Ubuntu distribution uses WSL2
+      ansible.windows.win_powershell:
+        parameters:
+          Distribution: "{{ wsl_distribution }}"
+        error_action: stop
+        script: |
+          param([string]$Distribution)
+          $Ansible.Changed = $false
+          $entries = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' |
+            Get-ItemProperty | Where-Object DistributionName -eq $Distribution)
+          if ($entries.Count -ne 1) { throw "Cannot identify registered distribution $Distribution." }
+          if ($entries[0].Version -eq 2) { return }
+          & wsl.exe --set-version $Distribution 2
+          if ($LASTEXITCODE -ne 0) { throw "WSL2 conversion failed with exit code $LASTEXITCODE." }
+          $Ansible.Changed = $true
+      async: 1800
+      poll: 15
+
+    - name: Verify Ubuntu version and configure systemd and default Linux user
+      ansible.windows.win_command:
+        argv:
+          - wsl.exe
+          - --distribution
+          - "{{ wsl_distribution }}"
+          - --user
+          - root
+          - --exec
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            source /etc/os-release
+            test "$ID" = ubuntu && test "$VERSION_ID" = 24.04 || {
+              echo "Expected Ubuntu 24.04; found $PRETTY_NAME" >&2
+              exit 1
+            }
+            if ! id {{ wsl_linux_user | quote }} >/dev/null 2>&1; then
+              useradd --create-home --shell /bin/bash {{ wsl_linux_user | quote }}
+              echo LINUX_USER_CREATED
+            fi
+            python3 - <<'PY'
+            import configparser
+            from pathlib import Path
+            path = Path("/etc/wsl.conf")
+            config = configparser.ConfigParser()
+            config.read(path)
+            desired = {"boot": {"systemd": "true"}, "user": {"default": "{{ wsl_linux_user }}"}}
+            changed = False
+            for section, options in desired.items():
+                if not config.has_section(section):
+                    config.add_section(section)
+                for key, value in options.items():
+                    if config.get(section, key, fallback=None) != value:
+                        config.set(section, key, value)
+                        changed = True
+            if changed:
+                with path.open("w") as stream:
+                    config.write(stream)
+                print("WSL_CONFIG_CHANGED")
+            PY
+      register: ubuntu_configuration
+      changed_when: >-
+        'LINUX_USER_CREATED' in ubuntu_configuration.stdout or
+        'WSL_CONFIG_CHANGED' in ubuntu_configuration.stdout
+
+    - name: Restart only this distribution to apply WSL configuration
+      ansible.windows.win_command:
+        argv: [wsl.exe, --terminate, "{{ wsl_distribution }}"]
+      when: "'WSL_CONFIG_CHANGED' in ubuntu_configuration.stdout"
+
+    - name: Stage Linux provisioning script without credentials
+      ansible.windows.win_template:
+        src: templates/ubuntu-bootstrap.sh.j2
+        dest: '{{ wsl_staging_path }}\ubuntu-bootstrap.sh'
+        newline_sequence: "\n"
+
+    - name: Install updates, Git, Docker CE, NVM, and Node.js LTS
+      ansible.windows.win_command:
+        argv:
+          - wsl.exe
+          - -d
+          - "{{ wsl_distribution }}"
+          - -u
+          - root
+          - --exec
+          - bash
+          - -c
+          - 'set -e; script=$(wslpath -a "$1"); exec bash "$script"'
+          - bootstrap
+          - '{{ wsl_staging_path }}\ubuntu-bootstrap.sh'
+      async: 3600
+      poll: 15
+
+    - name: Configure SSH credentials for private Git repositories
+      ansible.windows.win_powershell:
+        parameters:
+          Distribution: "{{ wsl_distribution }}"
+          LinuxUser: "{{ wsl_linux_user }}"
+          Payload: "{{ {'key': git_ssh_private_key, 'known_hosts': git_ssh_known_hosts} | to_json }}"
+        error_action: stop
+        script: |
+          param([string]$Distribution, [string]$LinuxUser, [string]$Payload)
+          $python = @'
+          import json, os, sys
+          from pathlib import Path
+          data = json.load(sys.stdin)
+          directory = Path.home() / ".ssh"
+          directory.mkdir(mode=0o700, exist_ok=True)
+          directory.chmod(0o700)
+          key = directory / "ansible_wsl"
+          fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, "w") as stream:
+              stream.write(data["key"].rstrip() + "\n")
+          key.chmod(0o600)
+          hosts = directory / "ansible_known_hosts"
+          hosts.write_text(data["known_hosts"].rstrip() + "\n")
+          hosts.chmod(0o600)
+          '@
+          # Avoid Windows PowerShell's legacy native-argument quote stripping.
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($python))
+          $entrypoint = "exec(__import__('base64').b64decode('$encoded'))"
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $Payload | & wsl.exe -d $Distribution -u $LinuxUser --exec python3 -c $entrypoint
+          if ($LASTEXITCODE -ne 0) { throw "SSH credential installation failed." }
+          & wsl.exe -d $Distribution -u $LinuxUser --exec git config --global core.sshCommand 'ssh -i ~/.ssh/ansible_wsl -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/ansible_known_hosts -o StrictHostKeyChecking=yes'
+          if ($LASTEXITCODE -ne 0) { throw "Git SSH configuration failed." }
+      when: git_ssh_private_key | length > 0
+      no_log: true
+
+    - name: Authenticate to Artifactory, GHCR, or other container registries
+      ansible.windows.win_powershell:
+        parameters:
+          Distribution: "{{ wsl_distribution }}"
+          LinuxUser: "{{ wsl_linux_user }}"
+          Registry: "{{ item.registry }}"
+          Username: "{{ item.username }}"
+          Token: "{{ item.password }}"
+        error_action: stop
+        script: |
+          param([string]$Distribution, [string]$LinuxUser, [string]$Registry, [string]$Username, [string]$Token)
+          $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $Token | & wsl.exe -d $Distribution -u $LinuxUser --exec docker login $Registry --username $Username --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw "Container registry authentication failed." }
+      loop: "{{ container_registries }}"
+      no_log: true
+
+    - name: Clone required repositories after credentials are configured
+      ansible.windows.win_command:
+        argv:
+          - wsl.exe
+          - -d
+          - "{{ wsl_distribution }}"
+          - -u
+          - "{{ wsl_linux_user }}"
+          - --exec
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            export GIT_TERMINAL_PROMPT=0
+            mkdir -p "$HOME/repos"
+            target="$HOME/repos/{{ item.name }}"
+            if [ -e "$target" ]; then
+              test "$(git -C "$target" rev-parse --show-toplevel)" = "$target"
+              test "$(git -C "$target" remote get-url origin)" = {{ item.url | quote }} || {
+                echo "Existing repository has a different origin: $target" >&2
+                exit 1
+              }
+              echo REPOSITORY_ALREADY_PRESENT
+            else
+              git clone -- {{ item.url | quote }} "$target"
+            fi
+      loop: "{{ required_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: repository_clone
+      changed_when: "'REPOSITORY_ALREADY_PRESENT' not in repository_clone.stdout"
+
+    - name: Pull common Docker images as the Linux user
+      ansible.windows.win_command:
+        argv:
+          - wsl.exe
+          - -d
+          - "{{ wsl_distribution }}"
+          - -u
+          - "{{ wsl_linux_user }}"
+          - --exec
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            {{ wsl_docker_ready_script }}
+            exec docker pull "$1"
+          - pull-image
+          - "{{ item }}"
+      loop: "{{ common_docker_images }}"
+      register: docker_pull
+      changed_when: "'Downloaded newer image' in docker_pull.stdout"
+      async: 1800
+      poll: 15
+
+    - name: Smoke-test Docker and Node.js without root
+      ansible.windows.win_command:
+        argv:
+          - wsl.exe
+          - -d
+          - "{{ wsl_distribution }}"
+          - -u
+          - "{{ wsl_linux_user }}"
+          - --exec
+          - bash
+          - -c
+          - |
+            set -eo pipefail
+            test "$(id -u)" -ne 0
+            {{ wsl_docker_ready_script }}
+            docker info
+            docker run --rm hello-world:latest
+            docker compose version
+            docker buildx version
+            export NVM_DIR="$HOME/.nvm"
+            source "$NVM_DIR/nvm.sh"
+            nvm use default
+            node --version
+            npm --version
+            node -e 'if (1 + 1 !== 2) process.exit(1); console.log("Node.js smoke test passed")'
+            git --version
+      changed_when: false
+      register: smoke_test
+      retries: 5
+      delay: 10
+      until: smoke_test is succeeded
+
+    - name: Verify registered WSL distribution versions
+      ansible.windows.win_command:
+        argv: [wsl.exe, --list, --verbose]
+      changed_when: false
+      register: wsl_distributions
+
+    - name: Display verified environment
+      ansible.builtin.debug:
+        msg:
+          windows_identity: "{{ windows_prerequisites.result.identity }}"
+          distribution: "{{ wsl_distribution }}"
+          linux_user: "{{ wsl_linux_user }}"
+          wsl_engine: "{{ wsl_version.stdout_lines }}"
+          wsl_distributions: "{{ wsl_distributions.stdout_lines }}"
+          smoke_test: "{{ smoke_test.stdout_lines }}"
+
+  post_tasks:
+    - name: Remove downloaded root filesystem and staging script
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - '{{ wsl_staging_path }}\ubuntu-24.04-rootfs.tar.gz'
+        - '{{ wsl_staging_path }}\ubuntu-bootstrap.sh'
